@@ -26,7 +26,7 @@ hsk_by_day = {
 def generate_prompt(hsk_level):
     return f"""
 Write a short story in simplified Chinese at HSK {hsk_level} level.
-Limit to 4-6 sentences. Output a JSON object with three keys:
+Make the story between 4 to 6 sentences. Output a JSON object with three keys:
 "chinese" (the original text), "pinyin", and "english" (translation).
 """
 
