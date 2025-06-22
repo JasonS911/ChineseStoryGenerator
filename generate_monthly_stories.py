@@ -61,8 +61,6 @@ end_date = datetime(today.year, today.month, end_day)  # Get the last day of the
 
 # Generate stories for all dates in the range
 current_date = start_date
-generate_story(current_date)
-
 while current_date <= end_date:
     generate_story(current_date)
     time.sleep(5)
