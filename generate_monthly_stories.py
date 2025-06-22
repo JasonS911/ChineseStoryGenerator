@@ -1,9 +1,10 @@
 from openai import OpenAI
 import os
 import json
-from datetime import datetime, time, timedelta, date
+from datetime import datetime, timedelta, date
 # from dotenv import load_dotenv
 import calendar
+import time
 
 # load_dotenv() 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
