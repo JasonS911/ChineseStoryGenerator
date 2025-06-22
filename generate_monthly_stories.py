@@ -2,10 +2,10 @@ from openai import OpenAI
 import os
 import json
 from datetime import datetime, timedelta, date
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 import calendar
 
-load_dotenv() 
+# load_dotenv() 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 # Folder to store generated stories
