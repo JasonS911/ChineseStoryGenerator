@@ -1,7 +1,7 @@
 from openai import OpenAI
 import os
 import json
-from datetime import datetime, timedelta, date
+from datetime import datetime, time, timedelta, date
 # from dotenv import load_dotenv
 import calendar
 
@@ -26,7 +26,7 @@ hsk_by_day = {
 def generate_prompt(hsk_level):
     return f"""
 Write a short story in simplified Chinese at HSK {hsk_level} level.
-Make the story between 4 to 6 sentences. Output a JSON object with three keys:
+The story should be between 4 to 6 sentences. Output a JSON object with three keys:
 "chinese" (the original text), "pinyin", and "english" (translation).
 """
 
@@ -64,4 +64,5 @@ generate_story(current_date)
 
 while current_date <= end_date:
     generate_story(current_date)
+    time.sleep(5)
     current_date += timedelta(days=1)
