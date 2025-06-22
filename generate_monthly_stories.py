@@ -36,7 +36,7 @@ def generate_story(date):
     prompt = generate_prompt(hsk_level)
 
     response = client.responses.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4-turbo",
         input= prompt,
     )
     
