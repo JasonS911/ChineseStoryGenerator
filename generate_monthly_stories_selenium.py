@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import calendar
 import json
 import re
 import sys
@@ -10,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import InvalidSessionIdException, TimeoutException, WebDriverException
 from selenium.webdriver import ActionChains
 from selenium.webdriver import ChromeOptions
 from selenium.webdriver.chrome.service import Service
@@ -31,7 +30,7 @@ HSK_BY_DAY = {
     6: 5,
 }
 
-DEFAULT_OUTPUT_DIR = Path("public/daily_story")
+DEFAULT_OUTPUT_FILE = Path("public/daily_story/stories.json")
 DEFAULT_PROFILE_DIR = Path(".selenium-chatgpt-profile")
 CHATGPT_URL = "https://chatgpt.com/"
 
@@ -83,15 +82,10 @@ def build_dates(start_date: date, end_date: date):
         current += timedelta(days=1)
 
 
-def month_end(d: date) -> date:
-    end_day = calendar.monthrange(d.year, d.month)[1]
-    return date(d.year, d.month, end_day)
-
-
 def parse_args():
     today = date.today()
     parser = argparse.ArgumentParser(
-        description="Generate monthly Chinese stories through ChatGPT in Selenium."
+        description="Generate Chinese stories through ChatGPT in Selenium."
     )
     parser.add_argument(
         "--start-date",
@@ -100,12 +94,17 @@ def parse_args():
     )
     parser.add_argument(
         "--end-date",
-        help="End date in YYYY-MM-DD format. Defaults to the last day of start-date's month.",
+        help="End date in YYYY-MM-DD format. Overrides --days if provided.",
     )
     parser.add_argument(
-        "--output-dir",
-        default=str(DEFAULT_OUTPUT_DIR),
-        help="Directory for generated JSON files.",
+        "--days",
+        type=int,
+        help="Number of days to generate starting from start-date when --end-date is not provided.",
+    )
+    parser.add_argument(
+        "--output-file",
+        default=str(DEFAULT_OUTPUT_FILE),
+        help="Path to the combined JSON output file.",
     )
     parser.add_argument(
         "--model",
@@ -137,11 +136,31 @@ def parse_args():
         default=180,
         help="Seconds to wait for ChatGPT responses.",
     )
+    parser.add_argument(
+        "--max-session-restarts",
+        type=int,
+        default=10,
+        help="Maximum number of times to recreate the browser session during one run.",
+    )
     return parser.parse_args()
 
 
 def parse_iso_date(raw: str) -> date:
     return datetime.strptime(raw, "%Y-%m-%d").date()
+
+
+def year_end(d: date) -> date:
+    return date(d.year, 12, 31)
+
+
+def resolve_end_date(start_date: date, end_date_raw: Optional[str], days: int) -> date:
+    if end_date_raw:
+        return parse_iso_date(end_date_raw)
+    if days is not None:
+        if days < 1:
+            raise ValueError("--days must be at least 1.")
+        return start_date + timedelta(days=days - 1)
+    return year_end(start_date)
 
 
 def create_driver(profile_dir: Path, driver_path: Optional[str], headless: bool):
@@ -159,6 +178,30 @@ def create_driver(profile_dir: Path, driver_path: Optional[str], headless: bool)
 
     service = Service(executable_path=driver_path) if driver_path else Service()
     return webdriver.Chrome(service=service, options=options)
+
+
+def quit_driver(driver):
+    if driver is None:
+        return
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+
+def start_ready_driver(args):
+    driver = create_driver(Path(args.profile_dir), args.driver_path, args.headless)
+    ensure_chat_ready(driver, args.model, args.timeout, args.manual_ready)
+    return driver
+
+
+def is_dead_session_error(exc: Exception) -> bool:
+    if isinstance(exc, InvalidSessionIdException):
+        return True
+    if isinstance(exc, WebDriverException):
+        message = str(exc).lower()
+        return "invalid session id" in message or "session deleted" in message
+    return False
 
 
 def build_chat_url(model: str) -> str:
@@ -196,9 +239,54 @@ def wait_for_visible_element(driver, selectors, timeout):
     raise TimeoutException("No visible matching element found.")
 
 
+def dump_debug_artifacts(driver, prefix: str):
+    screenshot_path = Path(f"{prefix}.png")
+    html_path = Path(f"{prefix}.html")
+
+    try:
+        driver.save_screenshot(str(screenshot_path))
+        print(f"Saved screenshot to {screenshot_path.resolve()}")
+    except Exception as exc:
+        print(f"Could not save screenshot: {exc}")
+
+    try:
+        html_path.write_text(driver.page_source, encoding="utf-8")
+        print(f"Saved HTML to {html_path.resolve()}")
+    except Exception as exc:
+        print(f"Could not save HTML: {exc}")
+
+
+def describe_page_state(driver) -> str:
+    current_url = driver.current_url
+    title = driver.title
+    body_text = driver.find_element(By.TAG_NAME, "body").text[:1000]
+
+    hints = []
+    lowered = body_text.lower()
+    if "log in" in lowered or "sign up" in lowered or "continue with" in lowered:
+        hints.append("page looks like a login screen")
+    if "verify you are human" in lowered or "captcha" in lowered:
+        hints.append("page may be blocked by a bot check")
+    if "something went wrong" in lowered:
+        hints.append("page shows an error state")
+
+    summary = f"URL: {current_url}\nTitle: {title}\nBody excerpt:\n{body_text}"
+    if hints:
+        summary += "\nHints: " + "; ".join(hints)
+    return summary
+
+
 def ensure_chat_ready(driver, model: str, timeout: int, manual_ready: bool):
     driver.get(build_chat_url(model))
-    wait_for_visible_element(driver, COMPOSER_SELECTORS, timeout)
+    try:
+        wait_for_visible_element(driver, COMPOSER_SELECTORS, timeout)
+    except TimeoutException as exc:
+        print(describe_page_state(driver))
+        dump_debug_artifacts(driver, "chatgpt_ready_failure")
+        raise TimeoutException(
+            "Could not find the ChatGPT composer. This usually means the CI browser is not logged in, "
+            "hit a bot check, or landed on a different page."
+        ) from exc
 
     if manual_ready:
         print(
@@ -325,7 +413,7 @@ def wait_for_response_text(driver, timeout: int) -> str:
     raise TimeoutException("Timed out waiting for ChatGPT response.")
 
 
-def generate_story(driver, story_date: date, output_dir: Path, model: str, timeout: int):
+def generate_story(driver, story_date: date, model: str, timeout: int):
     hsk_level = HSK_BY_DAY[story_date.weekday()]
     prompt = generate_prompt(hsk_level)
 
@@ -340,34 +428,82 @@ def generate_story(driver, story_date: date, output_dir: Path, model: str, timeo
             f"Could not parse JSON for {story_date.isoformat()}. Raw response:\n{raw_response}"
         ) from exc
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    filename = output_dir / f"{story_date.isoformat()}.json"
-    with filename.open("w", encoding="utf-8") as handle:
-        json.dump(story, handle, ensure_ascii=False, indent=2)
+    return story
 
-    print(f"Saved {filename}")
+
+def load_existing_stories(output_file: Path):
+    if not output_file.exists():
+        return {}
+
+    with output_file.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Existing output file must contain a JSON object: {output_file}")
+
+    return data
+
+
+def write_story_map(output_file: Path, stories_by_date):
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("w", encoding="utf-8") as handle:
+        json.dump(stories_by_date, handle, ensure_ascii=False, indent=2)
+
+    print(f"Saved {len(stories_by_date)} stories to {output_file}")
 
 
 def main():
     args = parse_args()
     start_date = parse_iso_date(args.start_date)
-    end_date = parse_iso_date(args.end_date) if args.end_date else month_end(start_date)
-    output_dir = Path(args.output_dir)
-    profile_dir = Path(args.profile_dir)
+    end_date = resolve_end_date(start_date, args.end_date, args.days)
+    output_file = Path(args.output_file)
+    stories_by_date = load_existing_stories(output_file)
 
     driver = None
+    session_restarts = 0
     try:
-        driver = create_driver(profile_dir, args.driver_path, args.headless)
-        ensure_chat_ready(driver, args.model, args.timeout, args.manual_ready)
+        driver = start_ready_driver(args)
 
         for story_date in build_dates(start_date, end_date):
-            try:
-                generate_story(driver, story_date, output_dir, args.model, args.timeout)
-            except Exception as exc:
-                print(f"Failed for {story_date.isoformat()}: {exc}", file=sys.stderr)
+            while True:
+                try:
+                    story = generate_story(driver, story_date, args.model, args.timeout)
+                    stories_by_date[story_date.isoformat()] = story
+                    write_story_map(output_file, stories_by_date)
+                    break
+                except Exception as exc:
+                    if is_dead_session_error(exc):
+                        session_restarts += 1
+                        print(
+                            f"Browser session died on {story_date.isoformat()}. Restarting session "
+                            f"({session_restarts}/{args.max_session_restarts})...",
+                            file=sys.stderr,
+                        )
+                        quit_driver(driver)
+                        driver = None
+
+                        if session_restarts > args.max_session_restarts:
+                            print(
+                                f"Failed for {story_date.isoformat()}: exceeded max session restarts.",
+                                file=sys.stderr,
+                            )
+                            break
+
+                        try:
+                            driver = start_ready_driver(args)
+                            continue
+                        except Exception as restart_exc:
+                            print(
+                                f"Failed to restart browser session for {story_date.isoformat()}: "
+                                f"{restart_exc}",
+                                file=sys.stderr,
+                            )
+                            break
+
+                    print(f"Failed for {story_date.isoformat()}: {exc}", file=sys.stderr)
+                    break
     finally:
-        if driver is not None:
-            driver.quit()
+        quit_driver(driver)
 
 
 if __name__ == "__main__":
